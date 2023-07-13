@@ -1,0 +1,270 @@
+import os
+import pickle
+import random
+from argparse import Namespace
+from collections import OrderedDict
+import time 
+import torch
+from path import Path
+from rich.console import Console
+from rich.progress import track
+from tqdm import tqdm
+import pandas as pd
+_CURRENT_DIR = Path(__file__).parent.abspath()
+
+import sys
+
+sys.path.append(_CURRENT_DIR.parent)
+
+from config.models import LeNet5, CNNGRU
+from config.util import (
+    DATA_DIR,
+    LOG_DIR,
+    PROJECT_DIR,
+    TEMP_DIR,
+    clone_parameters,
+    fix_random_seed,
+)
+
+sys.path.append(PROJECT_DIR)
+sys.path.append(DATA_DIR)
+from client.base import ClientBase
+from data.utils.util import get_client_id_indices
+torch.set_printoptions(precision=8)
+
+class ServerBase:
+    def __init__(self, args: Namespace, algo: str):
+        self.algo = algo
+        self.args = args
+        # default log file format
+        self.log_name = "{}_{}_{}_{}.html".format(
+            self.algo,
+            self.args.dataset,
+            self.args.global_epochs,
+            self.args.local_epochs,
+        )
+        self.device = torch.device(
+            "cuda" if self.args.gpu and torch.cuda.is_available() else "cpu"
+        )
+        fix_random_seed(self.args.seed)
+        # todo 更换模型backbone
+        # todo edited
+        # self.backbone = LeNet5
+        if self.args.dataset == 'AIS':
+            self.backbone = CNNGRU
+        else:
+            self.backbone = LeNet5
+
+        self.logger = Console(
+            record=True,
+            log_path=False,
+            log_time=False,
+        )
+        self.client_id_indices, self.client_num_in_total = get_client_id_indices(
+            self.args.dataset
+        )
+        self.temp_dir = TEMP_DIR / self.algo
+        if not os.path.isdir(self.temp_dir):
+            os.makedirs(self.temp_dir)
+
+        if self.args.dataset != 'AIS':
+            _dummy_model = self.backbone(self.args.dataset).to(self.device)
+        else:
+            _dummy_model = self.backbone().to(self.device)
+
+        passed_epoch = 0
+        self.global_params_dict: OrderedDict[str : torch.Tensor] = None
+        if os.listdir(self.temp_dir) != [] and self.args.save_period > 0:
+            if os.path.exists(self.temp_dir / "global_model.pt"):
+                self.global_params_dict = torch.load(self.temp_dir / "global_model.pt")
+                self.logger.log("Find existed global model...")
+
+            if os.path.exists(self.temp_dir / "epoch.pkl"):
+                with open(self.temp_dir / "epoch.pkl", "rb") as f:
+                    passed_epoch = pickle.load(f)
+                self.logger.log(
+                    f"Have run {passed_epoch} epochs already.",
+                )
+        else:
+            self.global_params_dict = OrderedDict(
+                _dummy_model.state_dict(keep_vars=True)
+            )
+
+        self.global_epochs = self.args.global_epochs - passed_epoch
+        self.logger.log("Backbone:", _dummy_model)
+
+        self.trainer: ClientBase = None
+        self.num_correct = [[] for _ in range(self.global_epochs)]
+        self.num_samples = [[] for _ in range(self.global_epochs)]
+
+    def train(self):
+        self.logger.log("=" * 30, "TRAINING", "=" * 30, style="bold green")
+        start = time.perf_counter()
+        progress_bar = (
+            track(
+                range(self.global_epochs),
+                "[bold green]Training...",
+                console=self.logger,
+            )
+            if not self.args.log
+            else tqdm(range(self.global_epochs), "Training...")
+        )
+        com_size = 0
+
+        out_csv = pd.DataFrame(columns=['round','Loss','time'])
+        round_list = []
+        loss_list = []
+        time_list = []
+        for E in progress_bar:
+            if E % self.args.verbose_gap == 0:
+                self.logger.log("=" * 30, f"ROUND: {E}", "=" * 30)
+                    
+            selected_clients = random.sample(
+                self.client_id_indices, self.args.client_num_per_round
+            )
+            res_cache = []
+            com_size = com_size + len(self.client_id_indices)*sys.getsizeof(clone_parameters(self.global_params_dict))
+            for client_id in selected_clients:
+                client_local_params = clone_parameters(self.global_params_dict)
+                res, stats = self.trainer.train(
+                    client_id=client_id,
+                    model_params=client_local_params,
+                    verbose=(E % self.args.verbose_gap) == 0,
+                )
+                com_size = com_size + sys.getsizeof(res)
+                for x in res:
+                    com_size = com_size + sys.getsizeof(x)
+                res_cache.append(res)
+                self.num_correct[E].append(stats["correct"])
+                self.num_samples[E].append(stats["size"])
+            #com_size = com_size + sys.getsizeof(res_cache)
+            self.aggregate(res_cache)
+
+            if E % self.args.verbose_gap == 0:
+                time_stamp = time.perf_counter()
+                t = time_stamp - start
+                self.logger.log("=" * 30, f"ROUND_time: {t}", "=" * 30)
+        #        self.test()
+                self.logger.log("=" * 30, "TESTING", "=" * 30, style="bold blue")
+                all_loss = []
+                all_correct = []
+                all_samples = []
+                for client_id in self.client_id_indices:
+                    client_local_params = clone_parameters(self.global_params_dict)
+                    stats = self.trainer.test(
+                        client_id=client_id,
+                        model_params=client_local_params,
+                    )
+            # self.logger.log(
+            #     f"client [{client_id}]  [red]loss: {(stats['loss'] / stats['size']):.4f}    [magenta]accuracy: {stats(['correct'] / stats['size'] * 100):.2f}%"
+            # )
+                    all_loss.append(stats["loss"])
+                    all_correct.append(stats["correct"])
+                    all_samples.append(stats["size"])
+                self.logger.log("=" * 20, "RESULTS", "=" * 20, style="bold green")
+                self.logger.log(
+                    "loss: {:.7f}    accuracy: {:.2f}%".format(
+                        sum(all_loss) / sum(all_samples),
+                        sum(all_correct) / sum(all_samples) * 100.0,
+                    )
+                )
+                #dict_log = {'round':E,'Loss':sum(all_loss)/sum(all_samples),'time':t}
+                #log_index = pd.DataFrame(dict_log, index=[0])
+                #out_csv = pd.concat([out_csv,log_index])
+                round_list.append(E)
+                time_list.append(t)
+                loss_list.append((sum(all_loss)/sum(all_samples)).cpu())
+
+            if E % self.args.save_period == 0:
+                torch.save(
+                    self.global_params_dict,
+                    self.temp_dir / "global_model.pt",
+                )
+                with open(self.temp_dir / "epoch.pkl", "wb") as f:
+                    pickle.dump(E, f)
+        data = {'round':round_list,'time':time_list,'Loss':loss_list}
+        print(data)
+        out_csv = pd.DataFrame(data)
+        out_csv.to_csv(r'//mnt//VMSTORE//fedves//'+self.algo+'.csv')
+        
+        avg_com_size = com_size/self.global_epochs
+        print("avg_com_size:"+str(avg_com_size))
+        print("com_size:"+str(com_size))
+
+    @torch.no_grad()
+    def aggregate(self, res_cache):
+        updated_params_cache = list(zip(*res_cache))[0]
+        weights_cache = list(zip(*res_cache))[1]
+        weight_sum = sum(weights_cache)
+        weights = torch.tensor(weights_cache, device=self.device) / weight_sum
+
+        aggregated_params = []
+
+        for params in zip(*updated_params_cache):
+            aggregated_params.append(
+                torch.sum(weights * torch.stack(params, dim=-1), dim=-1)
+            )
+
+        self.global_params_dict = OrderedDict(
+            zip(self.global_params_dict.keys(), aggregated_params)
+        )
+
+    def test(self) -> None:
+        self.logger.log("=" * 30, "TESTING", "=" * 30, style="bold blue")
+        all_loss = []
+        all_correct = []
+        all_samples = []
+        for client_id in track(
+            self.client_id_indices,
+            "[bold blue]Testing...",
+            console=self.logger,
+            disable=self.args.log,
+        ):
+            client_local_params = clone_parameters(self.global_params_dict)
+            stats = self.trainer.test(
+                client_id=client_id,
+                model_params=client_local_params,
+            )
+            # self.logger.log(
+            #     f"client [{client_id}]  [red]loss: {(stats['loss'] / stats['size']):.4f}    [magenta]accuracy: {stats(['correct'] / stats['size'] * 100):.2f}%"
+            # )
+            all_loss.append(stats["loss"])
+            all_correct.append(stats["correct"])
+            all_samples.append(stats["size"])
+        self.logger.log("=" * 20, "RESULTS", "=" * 20, style="bold green")
+        self.logger.log(
+            "loss: {:.4f}    accuracy: {:.2f}%".format(
+                sum(all_loss) / sum(all_samples),
+                sum(all_correct) / sum(all_samples) * 100.0,
+            )
+        )
+
+        acc_range = [90.0, 80.0, 70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0]
+        min_acc_idx = 10
+        max_acc = 0
+        for E, (corr, n) in enumerate(zip(self.num_correct, self.num_samples)):
+            avg_acc = sum(corr) / sum(n) * 100.0
+            for i, acc in enumerate(acc_range):
+                if avg_acc >= acc and avg_acc > max_acc:
+                    self.logger.log(
+                        "{} achieved {}% accuracy({:.2f}%) at epoch: {}".format(
+                            self.algo, acc, avg_acc, E
+                        )
+                    )
+                    max_acc = avg_acc
+                    min_acc_idx = i
+                    break
+            acc_range = acc_range[:min_acc_idx]
+
+    def run(self):
+        self.logger.log("Arguments:", dict(self.args._get_kwargs()))
+        self.train()
+        self.test()
+        if self.args.log:
+            if not os.path.isdir(LOG_DIR):
+                os.mkdir(LOG_DIR)
+            self.logger.save_html(LOG_DIR / self.log_name)
+
+        # delete all temporary files
+        if os.listdir(self.temp_dir) != []:
+            os.system(f"rm -rf {self.temp_dir}")
