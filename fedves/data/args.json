@@ -1,0 +1,1 @@
+{"alpha": 0, "classes": -1, "client_num_in_each_pickles": 10, "client_num_in_total": 10, "dataset": "AIS", "emnist_split": "byclass", "fraction": 0.9, "rate_clients": 0.1, "root": "/mnt/VMSTORE/fedves/root", "seed": 1689169069, "test_ratio": 0.1, "type": "sample", "valset_ratio": 0.1}
